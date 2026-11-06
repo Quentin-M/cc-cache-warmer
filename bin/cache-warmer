@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Keep an idle Claude Code session's prompt cache warm, then compact it.
 # Hook entry points: Stop, UserPromptSubmit, SessionEnd. `timer` and `quiet` run detached.
+# Types into the session's own cmux, herdr or tmux pane.
 # Flow and failure matrix: docs/PLAN.md.
 set -uo pipefail
 
@@ -10,6 +11,8 @@ DATA=${CLAUDE_PLUGIN_DATA:-${TMPDIR:-/tmp}/cc-cache-warmer}
 WARM_PROMPT='[cache-warmer] Keep-alive ping to hold the prompt cache. Reply with only: ok'
 LOG="$DATA/warmer.log"
 FLUSH=2
+SETTLE=1
+LOG_MAX=1000000
 
 log() { printf '%s %s %s\n' "$(date +%FT%T)" "${SID:-?}" "$*" >>"$LOG"; }
 
@@ -35,33 +38,84 @@ context_tokens() {
     | (.input_tokens // 0) + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0)' | tail -n 1
 }
 
-# Text in Claude Code's input box: the lines between the last two horizontal rules.
+# Text in Claude Code's input box: the lines between the last two horizontal rules,
+# minus the leading prompt marker. A ❯ typed into the box stays, so it fails the match.
 input_text() {
   awk '/^─/ { n++; last = prev; prev = NR } { line[NR] = $0 }
-       END { if (n < 2) exit 1; for (i = last + 1; i < prev; i++) print line[i] }' |
-    sed -e 's/❯//g' -e $'s/\xc2\xa0//g' -e 's/[[:space:]]//g'
+       END { if (n < 2) exit 1
+             for (i = last + 1; i < prev; i++) { s = line[i]; if (i == last + 1) sub(/^❯/, "", s); print s } }' |
+    sed -e $'s/\xc2\xa0//g' -e 's/[[:space:]]//g' | tr -d '\n'
 }
 
+# The terminal that owns this pane. TERM_PROGRAM names the innermost multiplexer;
+# pane variables of outer ones leak inward (tmux started in herdr keeps HERDR_PANE_ID).
+detect_terminal() {
+  case ${TERM_PROGRAM:-} in
+    tmux) MUX=tmux PANE=${TMUX_PANE:-} ;;
+    herdr) MUX=herdr PANE=${HERDR_PANE_ID:-} ;;
+    *) MUX=cmux PANE=${CMUX_SURFACE_ID:-} ;;
+  esac
+  [ -n "$PANE" ]
+}
+
+# herdr's `visible` source follows the scrollback viewport and tmux's capture-pane
+# ignores copy mode, while typed keys reach the live input or the mode's key table.
+# So read herdr's bottom-anchored `detection` snapshot and refuse a tmux pane in a mode.
+read_screen() {
+  case $MUX in
+    cmux) cmux read-screen --surface "$PANE" --lines 30 ;;
+    herdr) herdr pane read "$PANE" --source detection ;;
+    tmux) [ "$(tmux display-message -p -t "$PANE" '#{pane_in_mode}')" = 0 ] && tmux capture-pane -p -t "$PANE" ;;
+  esac
+}
+
+type_text() {
+  case $MUX in
+    cmux) cmux send --surface "$PANE" "$1" ;;
+    herdr) herdr pane send-text "$PANE" "$1" ;;
+    tmux) tmux send-keys -t "$PANE" -l "$1" ;;
+  esac
+}
+
+press_enter() {
+  case $MUX in
+    cmux) cmux send-key --surface "$PANE" enter ;;
+    herdr) herdr pane send-keys "$PANE" enter ;;
+    tmux) tmux send-keys -t "$PANE" Enter ;;
+  esac
+}
+
+input_box() { local screen; screen=$(read_screen) && input_text <<<"$screen"; }
+
+# Start time tells a live Claude Code apart from a new process that reused its pid.
+started() { ps -o lstart= -p "$1" 2>/dev/null; }
+
+# A timer owns the file timer.<pid>; deleting a file name only it holds cannot race a re-arm.
 kill_timer() {
-  [ -f "$DIR/pid" ] || return 0
-  kill "$(cat "$DIR/pid")" 2>/dev/null
-  rm -f "$DIR/pid"
+  local f
+  for f in "$DIR"/timer.*; do
+    [ -e "$f" ] || continue
+    kill "${f##*.}" 2>/dev/null
+    rm -f "$f"
+  done
 }
 
 pings_sent() { cat "$DIR/pings" 2>/dev/null || echo 0; }
 
 on_stop() {
-  [ -n "${CMUX_SURFACE_ID:-}" ] || { log "skip: not in cmux"; return; }
+  detect_terminal || { log "skip: no supported terminal"; return; }
+  [ -n "${CLAUDE_PID:-}" ] || { log "skip: no CLAUDE_PID"; return; }
   local since
   # Read before backgrounding: `&` expands its arguments in the child, racing the rm.
   if since=$(cat "$DIR/quiet" 2>/dev/null) && [ -n "$since" ]; then
     rm -f "$DIR/quiet"
-    nohup "$0" quiet "$DIR" "$CMUX_SURFACE_ID" "$since" >/dev/null 2>&1 </dev/null &
+    [ "$MUX" = cmux ] && nohup "$0" quiet "$DIR" "$PANE" "$since" >/dev/null 2>&1 </dev/null &
   fi
   [ "$(pings_sent)" -le "$PINGS" ] || { log "skip: done"; return; }
   kill_timer
-  nohup "$0" timer "$DIR" "$TRANSCRIPT" "$CMUX_SURFACE_ID" >/dev/null 2>&1 </dev/null &
-  echo $! >"$DIR/pid"
+  nohup "$0" timer "$DIR" "$TRANSCRIPT" "$MUX" "$PANE" "$CLAUDE_PID" "$(started "$CLAUDE_PID")" \
+    >/dev/null 2>&1 </dev/null &
+  touch "$DIR/timer.$!"
 }
 
 on_prompt() {
@@ -82,15 +136,29 @@ on_end() {
   rm -rf "$DIR"
 }
 
-still_current() { [ "$(cat "$DIR/pid" 2>/dev/null)" = "$$" ]; }
+still_current() { [ -e "$DIR/timer.$$" ]; }
+
+# Nobody cancelled this timer, used the session or closed Claude Code since it armed.
+# Reads the timer's armed_at, claude and claude_start.
+session_idle() {
+  still_current || return 1
+  local active
+  active=$(last_activity "$TRANSCRIPT")
+  [ "${active:-0}" -le "$armed_at" ] || { log "skip: session active"; return 1; }
+  [ -n "$claude_start" ] && [ "$(started "$claude")" = "$claude_start" ] || { log "skip: claude exited"; return 1; }
+}
 
 # Timer body. Runs detached; every guard logs why it did nothing.
 # Stop fires before the turn's usage line is flushed, so read the transcript after FLUSH.
 timer() {
   DIR=$1
   TRANSCRIPT=$2
+  MUX=$3
+  PANE=$4
   SID=$(basename "$DIR")
-  local surface=$3 ttl tokens delay wait
+  local claude=$5 claude_start=$6 ttl tokens delay wait armed_at
+  # The timer file stays until the timer ends so a prompt or SessionEnd can cancel every step.
+  trap 'rm -f "$DIR/timer.$$"' EXIT
   sleep "$FLUSH"
   still_current || exit 0
   ttl=$(cache_ttl "$TRANSCRIPT" 2>/dev/null)
@@ -99,20 +167,19 @@ timer() {
   [ "${tokens:-0}" -ge "$MIN_TOKENS" ] || { log "skip: small context tokens=${tokens:-0}"; exit 0; }
   delay=$((ttl - (ttl / 5 < 300 ? ttl / 5 : 300)))
   wait=${CC_CACHE_WARMER_DELAY:-$delay}
-  local armed_at
   armed_at=$(date +%s)
   log "armed ttl=$ttl delay=$delay sleep=$wait tokens=$tokens pings=$(pings_sent)/$PINGS"
   sleep "$wait"
-  still_current || exit 0
-  rm -f "$DIR/pid"
-  local active
-  active=$(last_activity "$TRANSCRIPT")
-  [ "${active:-0}" -le "$armed_at" ] || { log "skip: session active"; exit 0; }
-  local screen draft
-  screen=$(cmux read-screen --surface "$surface" --lines 30) || { log "skip: cannot read screen"; exit 0; }
-  draft=$(input_text <<<"$screen") || { log "skip: cannot read screen (no input box)"; exit 0; }
-  [ -z "$draft" ] || { log "skip: draft in input"; exit 0; }
-  send "$surface"
+  session_idle || exit 0
+  # An input box that stays empty across SETTLE has nobody typing into it.
+  local draft i
+  for i in 1 2; do
+    [ "$i" = 1 ] || sleep "$SETTLE"
+    draft=$(input_box) || { log "skip: cannot read screen"; exit 0; }
+    [ -z "$draft" ] || { log "skip: draft in input"; exit 0; }
+  done
+  session_idle || exit 0
+  send
 }
 
 # cmux's own Stop hook posts a notification for every turn, our pings included.
@@ -143,10 +210,20 @@ send() {
   [ "$n" -gt "$PINGS" ] && text=/compact
   printf '%s' "$text" >"$DIR/pending"
   date -u +%FT%TZ >"$DIR/sent_at"
-  if ! cmux send --surface "$1" "$text" || ! cmux send-key --surface "$1" enter; then
-    log "error: send failed"
+  type_text "$text" || { log "error: send failed"; exit 0; }
+  # Enter submits the whole box, so press it only while the box holds our text alone.
+  local want=${text//[[:space:]]/} got='' _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    got=$(input_box) && [ "$got" = "$want" ] && break
+    sleep 0.2
+  done
+  if [ "$got" != "$want" ]; then
+    rm -f "$DIR/pending" "$DIR/sent_at"
+    log "abort: input changed, ping left unsent"
     exit 0
   fi
+  session_idle || { rm -f "$DIR/pending" "$DIR/sent_at"; exit 0; }
+  press_enter || { log "error: send failed"; exit 0; }
   echo "$n" >"$DIR/pings"
   local what="warm $n/$PINGS"
   [ "$text" = /compact ] && what=compact
@@ -155,6 +232,7 @@ send() {
 
 main() {
   mkdir -p "$DATA"
+  [ -z "$(find "$LOG" -size +"$LOG_MAX"c 2>/dev/null)" ] || mv -f "$LOG" "$LOG.1"
   local event=${1:-}
   [ "$event" = timer ] && { shift; timer "$@"; exit 0; }
   [ "$event" = quiet ] && { shift; quiet "$@"; exit 0; }

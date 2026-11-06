@@ -11,9 +11,12 @@ cache expires, so the next turn reads the cache instead of rewriting it. After
 a few pings it compacts the session and stops, so a session you never come
 back to leaves a small summary to rewrite instead of the full context.
 
-> **Requires [cmux](https://github.com/manaflow-ai/cmux).** A hook can't submit
-> a prompt to Claude Code, so the plugin types into the session's own cmux pane.
-> tmux, iTerm2, and other terminals aren't supported yet. PRs welcome.
+> **Requires [cmux](https://github.com/manaflow-ai/cmux), [herdr](https://herdr.dev)
+> or tmux 3.2+.** A hook can't submit a prompt to Claude Code, so the plugin
+> types into the session's own pane. `TERM_PROGRAM` picks the innermost one:
+> Claude Code in tmux inside herdr gets tmux. iTerm2 and other terminals aren't
+> supported yet. PRs welcome. Claude Code must pass `CLAUDE_PID` to hooks
+> (v2.1.214 or later).
 
 ## How it works
 
@@ -23,18 +26,23 @@ you stop typing
 Stop hook ──▶ timer: wait 2 s, read the cache TTL from the transcript
       │
       ▼  sleep TTL - 5 min (55 min for 1h, 4 min for 5m)
-guards: session idle? input box empty? screen readable?
+guards: Claude Code alive? session idle? input box empty twice, 1 s apart?
       │
       ├─ pings < N ─▶ type the keep-alive prompt ─▶ reply ends a turn ─▶ Stop again
       ├─ pings = N ─▶ type /compact
       └─ pings > N ─▶ nothing, until you send a message
 ```
 
+Enter submits the whole input box, so the plugin presses it only after it
+reads its own text back alone in the box. If you type while it types, it
+leaves the ping unsent in your box and logs `abort: input changed`.
+
 Any message you type cancels the pending timer and resets the count. The
 plugin compares each prompt with the text it last sent, so its own pings
 don't reset the count.
 
-cmux posts a notification every time a turn ends, pings included. After each
+cmux posts a notification every time a turn ends, pings included. Only cmux
+lets the plugin clear it; on herdr and tmux a ping leaves its turn-done marker. After each
 ping's turn, the plugin dismisses the notifications on its pane created since
 it sent the ping, so pings don't leave unread markers. Notifications you had
 not read yet stay. A banner or phone push cmux already delivered can't be
@@ -100,8 +108,8 @@ claude plugin marketplace add STRML/cc-cache-warmer
 claude plugin install cc-cache-warmer@cc-cache-warmer
 ```
 
-Run Claude Code inside a cmux pane. Outside cmux, the plugin logs a skip and
-does nothing.
+Run Claude Code inside a cmux, herdr or tmux pane. Anywhere else, the plugin
+logs a skip and does nothing.
 
 ## Settings
 
@@ -120,13 +128,16 @@ Each skip is logged to `warmer.log` in the plugin's data directory
 
 | Log line | Cause |
 |---|---|
-| `skip: not in cmux` | `CMUX_SURFACE_ID` is unset. |
+| `skip: no supported terminal` | Not inside cmux, herdr or tmux. |
+| `skip: no CLAUDE_PID` | Claude Code did not pass its pid to the hook. Update to v2.1.214 or later. |
+| `skip: claude exited` | The Claude Code process that armed the timer is gone, so a shell may own the pane. |
 | `skip: no cache info` | The transcript has no cache write. Non-Anthropic backends often report none. |
 | `skip: small context` | The context is below `CC_CACHE_WARMER_MIN_TOKENS`. |
 | `skip: session active` | A message or reply landed after the timer armed. Idle recaps and metadata records do not count. |
 | `skip: draft in input` | You left text in the input box. The plugin won't type over it. |
-| `skip: cannot read screen` | `cmux read-screen` failed, or no input box is visible (for example, a permission prompt is open). |
+| `skip: cannot read screen` | Reading the pane failed, or no input box is visible (for example, a permission prompt is open). |
 | `skip: done` | The session is compacted. The next message you send restarts the cycle. |
+| `abort: input changed` | The input box held more than the ping after typing it. Enter was not pressed. |
 | `quiet: none` | No notification for the ping's turn showed up within 10 s, so nothing was dismissed. |
 
 ## Tests
@@ -136,7 +147,7 @@ Each skip is logged to `warmer.log` in the plugin's data directory
 ```
 
 Each scenario matches one row of the failure matrix in
-[docs/PLAN.md](docs/PLAN.md). A fake `cmux` on `PATH` records every call. The
+[docs/PLAN.md](docs/PLAN.md). Fake `cmux`, `herdr` and `tmux` on `PATH` record every call. The
 results land in `tests/out/results.txt`. CI runs shellcheck and the suite on
 Linux and macOS on pushes to main and on every pull request.
 

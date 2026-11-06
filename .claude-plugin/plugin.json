@@ -1,7 +1,7 @@
 {
   "name": "cc-cache-warmer",
   "version": "0.2.0",
-  "description": "Keeps an idle Claude Code session's prompt cache warm for a few TTL cycles, then compacts it. Requires cmux.",
+  "description": "Keeps an idle Claude Code session's prompt cache warm for a few TTL cycles, then compacts it. Requires cmux, herdr or tmux.",
   "author": { "name": "Samuel Reed" },
   "repository": "https://github.com/STRML/cc-cache-warmer",
   "license": "MIT"

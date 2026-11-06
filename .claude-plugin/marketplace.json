@@ -5,7 +5,7 @@
     {
       "name": "cc-cache-warmer",
       "source": "./",
-      "description": "Keeps an idle session's prompt cache warm, then compacts it. Requires cmux."
+      "description": "Keeps an idle session's prompt cache warm, then compacts it. Requires cmux, herdr or tmux."
     }
   ]
 }
